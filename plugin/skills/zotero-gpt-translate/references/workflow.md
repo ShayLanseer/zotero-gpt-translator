@@ -151,3 +151,13 @@ Link 注释按内容是否重排分类：替换区域的旧热区移除，再依
 `quality.json` 记录最低排版缩放、译文段落数、保留文字类别、全部页链接快照、页尺寸及书签检查。修改 translation JSON 或最终 PDF 后必须重建/复核。`attach` 要求复核记录与当前产物完全一致。
 
 运行失败时保留所有工作文件，不自动清理，不改写原 PDF。prepare 不覆盖已有工作目录；继续工作直接编辑已有 translation 文件。全部保存为 UTF-8 JSON，正文只作为纯文本转义进 HTML，不接受任意 HTML、脚本或远程图片。
+
+## 批量排版预检与计时
+
+`PYTHON SCRIPT preflight --work WORK` 检查全部已通过几何/覆盖验证的段落，保存 `preflight.json`；失败时非零退出，并列出页码、source_ids、矩形与原因。预检和 build 共用正文、引用颜色、字体、行距、首行缩进及最小字号逻辑；公式使用相同物理尺寸的占位图做排版，检查原文字形定位和边框，但将昂贵的字形隔离及隔离后完整性验证留给正式 build。报告中 `formula_isolation_checked=false` 明示这一边界。它不修改译稿、不输出交付 PDF；字体缓存和占位图可能在该工作目录生成。预检通过仍需完整 build、render 和人工复核。
+
+正常直接 build 即可，它自动预检；不用每次先单独 preflight 再 build。预检不通过时集中处理全部错误。引用区间错误、数学字形不匹配等问题也会与其他段落问题一起报告；覆盖或几何错误仍先由原 validate 处理。修正译文时不能删减信息或绕过字号下限。
+
+分段稿阶段用原有标记编译引用区间。逐页计划经过原生字形、公式拆分或几何修正后，不用旧分段稿覆盖该计划。直接修改逐页译文必须同步引用文字的 start/end/text，保留 link 对象及目标；同名引用的定位需结合原段和上下文，不猜测编号对应页面。
+
+计时字段：`preflight.json.seconds/pages` 统计整轮与逐页预排；`quality.json.timings_seconds` 包含 validation、font_preparation、layout_preflight、page_processing、font_subset、pdf_save、total，`page_timings_seconds` 记录实际逐页处理。各项可能包含缓存查验，total 还包括其他校验及 I/O；不能将这些机械处理耗时冒充模型翻译时间，也不能再与包含它们的墙钟区间相加。完整 PDF 复用时保留简化计时，不重新执行所有阶段。
