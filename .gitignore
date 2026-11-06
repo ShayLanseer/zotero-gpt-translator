@@ -1,0 +1,29 @@
+# Machine-specific configuration and credentials
+runtime.local.json
+.zotero/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Python dependencies and caches
+.runtime/
+runtime/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Papers, translation work and fonts
+work/
+test-output/
+*.pdf
+*.ttf
+*.ttc
+*.otf
+*.zip
+*.log
+.DS_Store
+Thumbs.db
