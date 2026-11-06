@@ -89,6 +89,74 @@ def write_plan(work):
 
 
 class Pipeline(unittest.TestCase):
+    def test_layout_preflight_defers_formula_isolation(self):
+        path = self.work/'pages/0001.translation.json'
+        plan = t.load(path)
+        item = plan['items'][0]
+        source = t.load(self.work/'pages/0001.source.json')
+        span = next(s for b in source['blocks'] for s in b['spans'] if s['id'] == item['source_ids'][0])
+        item['text'] = '标题{{math:probe}}'
+        item['math'] = [{'id':'probe', 'bbox':span['bbox']}]
+        t.save(path, plan)
+        with patch.object(t, 'math_asset', side_effect=AssertionError('preflight must not isolate glyphs')):
+            quiet(t.preflight, args(work=str(self.work)))
+        report = t.load(self.work/'preflight.json')
+        self.assertTrue(report['valid'])
+        self.assertFalse(report['formula_isolation_checked'])
+        self.assertFalse(list((self.work/'math-assets').glob('math-*.png')))
+        self.assertFalse((self.work/'中文全文译文.pdf').exists())
+
+    def test_preflight_collects_multiple_failures_without_changing_plans_or_pdf(self):
+        paths = sorted((self.work/'pages').glob('*.translation.json'))
+        first, second = (t.load(p) for p in paths)
+        first['items'][0]['text'] = '此处故意放入过长译文以验证批量排版检查。'*500
+        second['items'][0]['text'] = '另一页也必须在同一轮报告排版失败。'*500
+        linked = next(i for i in first['items'] if i.get('runs'))
+        linked['text'] = '改字'+linked['text']
+        t.save(paths[0], first); t.save(paths[1], second)
+        before = [t.digest(p) for p in paths]
+        with self.assertRaisesRegex(ValueError, '排版预检'):
+            quiet(t.build, args(work=str(self.work)))
+        report = t.load(self.work/'preflight.json')
+        self.assertFalse(report['valid'])
+        self.assertEqual(report['checked_paragraphs'], len(first['items'])+len(second['items']))
+        self.assertEqual({e['page'] for e in report['errors']}, {1, 2})
+        self.assertTrue(any('引用区间' in e['error'] for e in report['errors']))
+        self.assertGreaterEqual(sum('放不下' in e['error'] for e in report['errors']), 2)
+        self.assertEqual(before, [t.digest(p) for p in paths])
+        self.assertFalse((self.work/'中文全文译文.pdf').exists())
+        self.assertFalse((self.work/'review.json').exists())
+
+    def test_paragraph_redaction_preserves_foreign_text_in_gap(self):
+        for foreign in (False, True):
+            with self.subTest(foreign_text=foreign):
+                original = fitz.open()
+                original.new_page(width=300, height=200)
+                original[0].insert_text((40, 45), 'alpha')
+                if foreign:
+                    original[0].insert_text((40, 70), 'KEEP')
+                original[0].insert_text((40, 95), 'omega')
+                source = t.page_source(original[0])
+                spans = [s for b in source['blocks'] for s in b['spans']]
+                selected = [s for s in spans if s['text'] in ('alpha', 'omega')]
+                self.assertEqual(len(selected), 2)
+                item = {'source_spans': selected, 'source_ids': [s['id'] for s in selected]}
+                boxes = list(t.redaction_regions([item], source))
+                self.assertEqual(len(boxes), 2 if foreign else 1)
+                with fitz.open(stream=original.tobytes(), filetype='pdf') as legacy, fitz.open(stream=original.tobytes(), filetype='pdf') as batched:
+                    for s in selected:
+                        legacy[0].add_redact_annot(s['bbox'], fill=False, cross_out=False)
+                    for box in boxes:
+                        batched[0].add_redact_annot(box, fill=False, cross_out=False)
+                    for doc in (legacy, batched):
+                        doc[0].apply_redactions(images=0, graphics=0, text=0)
+                    self.assertEqual(legacy[0].get_pixmap().samples, batched[0].get_pixmap().samples)
+                    self.assertEqual(legacy[0].get_text(), batched[0].get_text())
+                    self.assertEqual('KEEP' in batched[0].get_text(), foreign)
+                    self.assertNotIn('alpha', batched[0].get_text())
+                    self.assertNotIn('omega', batched[0].get_text())
+                original.close()
+
     def test_selected_math_glyphs_exclude_neighbour_ink_and_cache(self):
         original=fitz.open();original.new_page(width=200,height=150)
         original[0].insert_text((50,80),'x',fontsize=18)
