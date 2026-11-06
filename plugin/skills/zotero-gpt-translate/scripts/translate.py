@@ -680,6 +680,166 @@ def math_asset(original, page_number, crop, assets, source_hash):
     return name
 
 
+def redaction_regions(items, source):
+    """Batch a paragraph only when its box touches no foreign source text.
+
+    Graphics and images remain untouched by apply_redactions. A paragraph with
+    any intervening kept/other text uses the original per-span rectangles.
+    """
+    index = RectIndex((s['id'], s['bbox']) for b in source['blocks'] for s in b['spans'])
+    for item in items:
+        own = set(item['source_ids'])
+        box = union(item['source_spans'])
+        if any(key not in own and intersection(box, other) > 0
+               for key, other in index.candidates(box)):
+            yield from (s['bbox'] for s in item['source_spans'])
+        else:
+            yield box
+
+
+def paragraph_markup(item, run_links, original, pno, assets, source_hash, preview_glyphs=None):
+    raw_text = item["text"]
+    fragments, cursor = [], 0
+    for run in sorted(item.get("runs", []), key=lambda r: r["start"]):
+        start, end = run["start"], run["end"]
+        if start < cursor or end <= start or raw_text[start:end] != run["text"]:
+            raise ValueError("引用区间重叠或与原文不符。")
+        if run.get("kind") not in {"citation", "crossref", "hyperlink"}:
+            raise ValueError("引用标注类别无效。")
+        if len(run_links) >= 150:
+            raise ValueError("单页引用标注数量过多。")
+        # Encode unique locator colors without carrying blue into
+        # green on citation-heavy pages (the previous +index did).
+        index = len(run_links)
+        color_key = (0xB02020 if run["kind"] == "crossref" else 0x0060A0) + ((index % 40) << 8) + index // 40
+        run_links[color_key] = run.get("link")
+        fragments.extend([html.escape(raw_text[cursor:start]), f'<span style="color:#{color_key:06x}">'+html.escape(raw_text[start:end])+"</span>"])
+        cursor = end
+    fragments.append(html.escape(raw_text[cursor:]))
+    text = "".join(fragments).replace("\n", "<br>")
+    for m in item.get("math", []):
+        if preview_glyphs is None:
+            name = math_asset(original, pno, m, assets, source_hash)
+        else:
+            # Only the explicitly declared physical image dimensions determine
+            # layout. Defer expensive glyph isolation to the actual build.
+            if m.get("glyphs"):
+                if pno not in preview_glyphs:
+                    chars = [c for b in original[pno].get_text("rawdict")["blocks"] if b["type"] == 0 for l in b["lines"] for s in l["spans"] for c in s["chars"] if c["c"].strip()]
+                    preview_glyphs[pno] = {(c["c"], tuple(round(v, 3) for v in c["origin"])): c for c in chars}
+                requested = {(c["c"], tuple(round(v, 3) for v in c["origin"])) for c in m["glyphs"]}
+                native = preview_glyphs[pno]
+                if not requested <= native.keys():
+                    raise ValueError("行内公式的原文字形选择与源 PDF 不符。")
+                bounds = fitz.Rect(m["bbox"])+(-1,-1,1,1)
+                if any(not bounds.contains(fitz.Rect(native[k]["bbox"])) for k in requested):
+                    raise ValueError("公式裁取框没有完整覆盖所选原文字形。")
+            name = "preflight-placeholder.png"
+            if not (assets/name).is_file():
+                pix = fitz.Pixmap(fitz.csRGB, (0,0,2,2), True)
+                pix.clear_with(0)
+                pix.save(assets/name)
+        r = fitz.Rect(m["bbox"])
+        tag = f'<img src="{name}" style="width:{r.width}pt;height:{r.height}pt;vertical-align:middle">'
+        text = text.replace("{{math:"+m["id"]+"}}", tag)
+    return text
+
+
+def paragraph_style(item, text, assets, font_files):
+    size = item["font_size"]
+    # CJK font comes from MuPDF's bundled Noto fallback and is embedded.
+    bold = sum(len(s["text"]) for s in item["source_spans"] if s["flags"] & 16) > sum(len(s["text"]) for s in item["source_spans"])/2
+    color = item["source_spans"][0]["color"]
+    typography = item.get("typography", {})
+    family = "sans-serif"
+    font_css = ""
+    line_height = float(typography.get("line_height", 1.05))
+    indent = float(typography.get("indent_em", 0))
+    if not 1 <= line_height <= 2 or not 0 <= indent <= 3:
+        raise ValueError("行距或首行缩进超出允许范围。")
+    if typography.get("family") == "song":
+        for font_file in ["font-simsun.ttf", "font-times.ttf"]:
+            if not (assets / font_file).is_file():
+                raise ValueError("宋体样式需要工作目录 math-assets 中的本机宋体及 Times 字体。")
+        family = "TranslationSong"
+        font_css = "@font-face {font-family:TranslationSong;src:url("+font_files["font-simsun.ttf"]+")} @font-face {font-family:TranslationLatin;src:url("+font_files["font-times.ttf"]+")}"
+        # MuPDF selects the first family before CJK fallback rather
+        # than following a CSS family list for missing characters.
+        # Give Latin text its own explicit face without touching tags.
+        pieces = re.split(r"(<[^>]+>)", text)
+        for pi in range(0, len(pieces), 2):
+            plain = html.unescape(pieces[pi])
+            rebuilt, cursor = [], 0
+            for match in re.finditer(r"[A-Za-z][A-Za-z0-9 .+/-]*[A-Za-z0-9]|[A-Za-z]", plain):
+                rebuilt.append(html.escape(plain[cursor:match.start()]))
+                rebuilt.append('<span style="font-family:TranslationLatin">'+html.escape(match.group(0))+'</span>')
+                cursor = match.end()
+            rebuilt.append(html.escape(plain[cursor:]))
+            pieces[pi] = "".join(rebuilt)
+        text = "".join(pieces)
+    if typography.get("weight") == "normal":
+        bold = False
+    alignment = typography.get("align", item["align"])
+    if alignment not in {"left", "center", "right", "justify"}:
+        raise ValueError("正文对齐方式无效。")
+    css = font_css + f"* {{margin:0;padding:0}} body {{font-family:{family};font-size:{size}pt;line-height:{line_height};color:#{color:06x};font-weight:{'bold' if bold else 'normal'};text-align:{alignment}}} p {{margin:0;padding:0;text-indent:{indent}em}}"
+    if indent:
+        text = "<p>" + text + "</p>"
+    return text, css
+
+
+def layout_preflight(work, manifest, sources, prepared, font_files=None):
+    """Check every paragraph with build's exact markup, fonts and layout limits.
+
+    Only scratch pages and disposable asset caches are written. Never creates a
+    delivery PDF, changes plans, lowers font floors or authorizes a review.
+    """
+    started = time.perf_counter()
+    assets = work / "math-assets"
+    assets.mkdir(exist_ok=True)
+    if font_files is None:
+        font_files, _ = rendering_fonts(assets, prepared)
+    errors, checked, page_times = [], 0, []
+    preview_glyphs = {}
+    archive = fitz.Archive(str(assets))
+    with fitz.open(work / "source.pdf") as original:
+        for pno, items in enumerate(prepared):
+            page_start = time.perf_counter()
+            run_links = {}
+            with fitz.open() as scratch:
+                page = scratch.new_page(width=sources[pno]["width"], height=sources[pno]["height"])
+                for item in items:
+                    checked += 1
+                    try:
+                        text = paragraph_markup(item, run_links, original, pno, assets, manifest["source_sha256"], preview_glyphs)
+                        text, css = paragraph_style(item, text, assets, font_files)
+                        spare, scale = page.insert_htmlbox(item["bbox"], text, css=css, archive=archive, scale_low=item["floor"]/item["font_size"])
+                        if spare < 0 or item["font_size"]*scale < item["floor"]-0.01:
+                            raise ValueError("段落放不下；请调整忠实译文或经过核实的区域，不降低字号下限。")
+                    except (ValueError, KeyError, TypeError) as exc:
+                        errors.append({"page": pno+1, "source_ids": item["source_ids"], "bbox": item["bbox"], "error": str(exc)})
+            page_times.append({"page": pno+1, "seconds": time.perf_counter()-page_start})
+    report = {"valid": not errors, "checked_paragraphs": checked, "errors": errors,
+              "source_sha256": manifest["source_sha256"], "plan_sha256": plan_hash(work, manifest["page_count"]),
+              "seconds": time.perf_counter()-started, "pages": page_times,
+              "formula_isolation_checked": False}
+    save(work / "preflight.json", report)
+    return report
+
+
+def require_layout(report):
+    if report["errors"]:
+        raise ValueError("排版预检发现以下问题（已检查全部段落；详见 preflight.json）：\n" + "\n".join(
+            f"第 {e['page']} 页 {e['source_ids'][0]}：{e['error']}" for e in report["errors"]))
+
+
+def preflight(args):
+    work, manifest, sources, _, prepared = validate(args.work)
+    report = layout_preflight(work, manifest, sources, prepared)
+    emit(report)
+    require_layout(report)
+
+
 def build(args):
     started = time.perf_counter()
     work, manifest, sources, plans, prepared = validate(args.work)
@@ -707,12 +867,20 @@ def build(args):
     measurements = []
     added_link_count = 0
     link_checks = []
+    stages = {"validation": validated_at-started}
+    page_times = []
     try:
         assets = work / "math-assets"
         assets.mkdir(exist_ok=True)
+        step = time.perf_counter()
         font_files, font_hashes = rendering_fonts(assets, prepared)
+        stages["font_preparation"] = time.perf_counter()-step
+        step = time.perf_counter()
+        require_layout(layout_preflight(work, manifest, sources, prepared, font_files))
+        stages["layout_preflight"] = time.perf_counter()-step
         archive = fitz.Archive(str(assets))
         for pno, items in enumerate(prepared):
+            page_start = time.perf_counter()
             page = doc[pno]
             links, moved_links = plan_page_links(page, items)
             moved_xrefs = [link["xref"] for link in moved_links]
@@ -728,76 +896,16 @@ def build(args):
                         break
             run_links = {}
             contents = []
-            for idx, item in enumerate(items):
-                raw_text = item["text"]
-                fragments, cursor = [], 0
-                for run in sorted(item.get("runs", []), key=lambda r: r["start"]):
-                    start, end = run["start"], run["end"]
-                    if start < cursor or end <= start or raw_text[start:end] != run["text"]:
-                        raise ValueError("引用区间重叠或与原文不符。")
-                    if run.get("kind") not in {"citation", "crossref", "hyperlink"}:
-                        raise ValueError("引用标注类别无效。")
-                    if len(run_links) >= 150:
-                        raise ValueError("单页引用标注数量过多。")
-                    # Encode unique locator colors without carrying blue into
-                    # green on citation-heavy pages (the previous +index did).
-                    index = len(run_links)
-                    color_key = (0xB02020 if run["kind"] == "crossref" else 0x0060A0) + ((index % 40) << 8) + index // 40
-                    run_links[color_key] = run.get("link")
-                    fragments.extend([html.escape(raw_text[cursor:start]), f'<span style="color:#{color_key:06x}">'+html.escape(raw_text[start:end])+"</span>"])
-                    cursor = end
-                fragments.append(html.escape(raw_text[cursor:]))
-                text = "".join(fragments).replace("\n", "<br>")
-                for m in item.get("math", []):
-                    name = math_asset(original, pno, m, assets, manifest["source_sha256"])
-                    r = fitz.Rect(m["bbox"])
-                    tag = f'<img src="{name}" style="width:{r.width}pt;height:{r.height}pt;vertical-align:middle">'
-                    text = text.replace("{{math:"+m["id"]+"}}", tag)
-                contents.append(text)
-                for s in item["source_spans"]:
-                    page.add_redact_annot(s["bbox"], fill=False, cross_out=False)
+            for item in items:
+                contents.append(paragraph_markup(item, run_links, original, pno, assets, manifest["source_sha256"]))
+            for box in redaction_regions(items, sources[pno]):
+                page.add_redact_annot(box, fill=False, cross_out=False)
             if items:
                 page.apply_redactions(images=0, graphics=0, text=0)
             for item, text in zip(items, contents):
                 size = item["font_size"]
-                # CJK font comes from MuPDF's bundled Noto fallback and is embedded.
-                bold = sum(len(s["text"]) for s in item["source_spans"] if s["flags"] & 16) > sum(len(s["text"]) for s in item["source_spans"])/2
-                color = item["source_spans"][0]["color"]
                 typography = item.get("typography", {})
-                family = "sans-serif"
-                font_css = ""
-                line_height = float(typography.get("line_height", 1.05))
-                indent = float(typography.get("indent_em", 0))
-                if not 1 <= line_height <= 2 or not 0 <= indent <= 3:
-                    raise ValueError("行距或首行缩进超出允许范围。")
-                if typography.get("family") == "song":
-                    for font_file in ["font-simsun.ttf", "font-times.ttf"]:
-                        if not (assets / font_file).is_file():
-                            raise ValueError("宋体样式需要工作目录 math-assets 中的本机宋体及 Times 字体。")
-                    family = "TranslationSong"
-                    font_css = "@font-face {font-family:TranslationSong;src:url("+font_files["font-simsun.ttf"]+")} @font-face {font-family:TranslationLatin;src:url("+font_files["font-times.ttf"]+")}"
-                    # MuPDF selects the first family before CJK fallback rather
-                    # than following a CSS family list for missing characters.
-                    # Give Latin text its own explicit face without touching tags.
-                    pieces = re.split(r"(<[^>]+>)", text)
-                    for pi in range(0, len(pieces), 2):
-                        plain = html.unescape(pieces[pi])
-                        rebuilt, cursor = [], 0
-                        for match in re.finditer(r"[A-Za-z][A-Za-z0-9 .+/-]*[A-Za-z0-9]|[A-Za-z]", plain):
-                            rebuilt.append(html.escape(plain[cursor:match.start()]))
-                            rebuilt.append('<span style="font-family:TranslationLatin">'+html.escape(match.group(0))+'</span>')
-                            cursor = match.end()
-                        rebuilt.append(html.escape(plain[cursor:]))
-                        pieces[pi] = "".join(rebuilt)
-                    text = "".join(pieces)
-                if typography.get("weight") == "normal":
-                    bold = False
-                alignment = typography.get("align", item["align"])
-                if alignment not in {"left", "center", "right", "justify"}:
-                    raise ValueError("正文对齐方式无效。")
-                css = font_css + f"* {{margin:0;padding:0}} body {{font-family:{family};font-size:{size}pt;line-height:{line_height};color:#{color:06x};font-weight:{'bold' if bold else 'normal'};text-align:{alignment}}} p {{margin:0;padding:0;text-indent:{indent}em}}"
-                if indent:
-                    text = "<p>" + text + "</p>"
+                text, css = paragraph_style(item, text, assets, font_files)
                 spare, scale = page.insert_htmlbox(item["bbox"], text, css=css, archive=archive, scale_low=item["floor"]/size)
                 if spare < 0 or size*scale < item["floor"]-0.01:
                     raise ValueError(f"第 {pno+1} 页段落 {item['source_ids'][0]} 放不下；不会加页或跳过。请调整忠实译文/核实空白区域。")
@@ -837,13 +945,18 @@ def build(args):
             if preserved_signatures - Counter(link_signature(page)) or len(page.get_links()) != sum(preserved_signatures.values()) + page_added:
                 raise ValueError("链接数量与保留/重建记录不一致。")
             link_checks.append({"retained_raw": [raw for _, raw in links], "expected_links": link_signature(page), "removed_xrefs": moved_xrefs, "removed_original_regions": len(moved_links)})
+            page_times.append({"page": pno+1, "seconds": time.perf_counter()-page_start})
         # Original destination xref references remain stable (no renumbering).
         # Embed only glyphs actually used; CJK font collections otherwise add
         # their full payload for every independent Story text region.
+        step = time.perf_counter()
         doc.subset_fonts()
+        stages["font_subset"] = time.perf_counter()-step
         # Level 1 removes the now-unreferenced full font streams but preserves
         # xref numbering, including original link and bookmark destinations.
+        step = time.perf_counter()
         doc.save(output, deflate=True, garbage=1)
+        stages["pdf_save"] = time.perf_counter()-step
     finally:
         doc.close()
         original.close()
@@ -863,7 +976,8 @@ def build(args):
     quality["rebuilt_link_regions"] = added_link_count
     quality["removed_original_link_regions"] = sum(check["removed_original_regions"] for check in link_checks)
     quality["retained_original_link_regions"] = sum(len(check["retained_raw"]) for check in link_checks)
-    quality["timings_seconds"] = {"validation": validated_at-started, "total": time.perf_counter()-started}
+    quality["timings_seconds"] = {**stages, "page_processing": sum(p["seconds"] for p in page_times), "total": time.perf_counter()-started}
+    quality["page_timings_seconds"] = page_times
     quality["build_inputs"] = inputs
     quality["reused_complete_pdf"] = False
     save(work / "quality.json", quality)
@@ -1005,7 +1119,7 @@ def main():
     g = s.add_mutually_exclusive_group(required=True)
     g.add_argument("--key"); g.add_argument("--pdf")
     s.add_argument("--work", required=True)
-    for cmd in ["validate", "build", "render", "review", "attach"]:
+    for cmd in ["validate", "preflight", "build", "render", "review", "attach"]:
         s = subs.add_parser(cmd); s.add_argument("--work", required=True)
         if cmd == "build": s.add_argument("--output")
         if cmd == "review": s.add_argument("--note", required=True)
