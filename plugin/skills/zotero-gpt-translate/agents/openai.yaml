@@ -1,0 +1,4 @@
+interface:
+  display_name: "Zotero GPT 全文翻译"
+  short_description: "逐段翻译 Zotero 论文，保留页码、公式、图表和链接，生成中文附件"
+  default_prompt: "使用 $zotero-gpt-translate 将这篇 Zotero 论文全文翻译成中文 PDF，尽量保持原页排版并添加到对应条目。"
