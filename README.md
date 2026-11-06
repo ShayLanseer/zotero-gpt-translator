@@ -2,7 +2,7 @@
 
 面向本地桌面 Codex 的论文全文翻译插件。由当前聊天模型逐段翻译，Python 脚本负责读取 PDF、校验翻译计划、排版和将译文添加到 Zotero 原条目。
 
-当前插件版本：**0.1.9**。这是 Codex 插件，不是安装进 Zotero 的 `.xpi` 扩展。
+当前插件版本：**0.1.10**。这是 Codex 插件，不是安装进 Zotero 的 `.xpi` 扩展。更新内容和性能边界见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 能做什么
 
@@ -110,7 +110,7 @@ py -3.12 .\plugin\skills\zotero-gpt-translate\scripts\translate.py fonts --work 
 2. `search` / `inspect` 核实条目、原文附件和父条目。
 3. `prepare` 提取原页、文字、链接、预览与分段稿。
 4. 由聊天模型阅读原文并完成译文、保留区域及公式和引用标记；`compile` 将分段稿转为逐页计划。
-5. `fonts` 从本机准备字体；`validate` / `build` / `render` 校验并生成 PDF 和预览。
+5. `fonts` 从本机准备字体；`build` 自动执行完整验证与批量排版预检，通过后生成 PDF，再用 `render` 输出预览。单独排查问题可运行 `preflight --work WORK`，并集中处理 `preflight.json` 中的错误。
 6. 核对全部页的语义与视觉效果，完成 `review` 后，在用户授权下执行 `attach`。
 
 `draft` 可重新生成分段草稿，继续任务前先核对已有译稿，避免覆盖。更详细的数据格式和操作要求见 [SKILL.md](plugin/skills/zotero-gpt-translate/SKILL.md) 与 [workflow.md](plugin/skills/zotero-gpt-translate/references/workflow.md)。
@@ -132,7 +132,7 @@ $env:ZGT_DEPS = (Resolve-Path .\.runtime).Path
 py -3.12 -X utf8 .\tests\test_translation.py
 ```
 
-测试产物位于 `test-output/`，不提交到仓库。测试覆盖几何约束、链接、公式裁切、字体、缓存、复核失效和模拟附件重试等行为；通过测试不等于任意真实论文的端到端翻译已通过。
+测试产物位于 `test-output/`，不提交到仓库。当前版本通过 20 项离线行为测试，覆盖几何约束、链接、公式裁切、字体、缓存、复核失效、模拟附件重试、批量排版失败报告和预检延后公式隔离等行为；通过测试不等于任意真实论文的端到端翻译已通过。
 
 ## 仓库内容
 
