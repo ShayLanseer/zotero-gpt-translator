@@ -1,0 +1,16 @@
+{
+  "name": "zotero-gpt-translator",
+  "version": "0.1.9",
+  "description": "用当前聊天中的 GPT 翻译 Zotero 论文全文，尽量保持原页排版与链接，生成中文 PDF 并添加到原条目。",
+  "author": {"name": "Lanseer"},
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Zotero GPT 全文翻译",
+    "shortDescription": "GPT 全文翻译，保留原页、公式图表与链接",
+    "longDescription": "在本地桌面 Codex 中，由当前模型逐段翻译论文，按原页替换正文，保留图表、公式及链接，并将中文 PDF 添加为原 Zotero 条目的附件。无需另外配置翻译 API Key。",
+    "developerName": "Lanseer",
+    "category": "Education & Research",
+    "capabilities": ["Read", "Write"],
+    "defaultPrompt": ["把 Zotero 中的这篇论文全文翻译成中文 PDF，保持原页排版、公式图表和链接，并添加到原条目。"]
+  }
+}
