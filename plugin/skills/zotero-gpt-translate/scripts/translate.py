@@ -593,7 +593,7 @@ def rendering_fonts(assets, prepared):
 def build_inputs(work, manifest):
     assets = work / "math-assets"
     from fontTools import __version__ as fonttools_version
-    return {"engine": digest(__file__), "pymupdf": fitz.VersionBind, "fonttools": fonttools_version, "source": manifest["source_sha256"], "plans": [digest(work/"pages"/f"{i+1:04}.translation.json") for i in range(manifest["page_count"])], "fonts": {name: digest(assets/name) for name in ["font-simsun.ttf", "font-times.ttf"] if (assets/name).is_file()}}
+    return {"engine": digest(__file__), "crop_engine": digest(Path(__file__).with_name("crop_guard.py")), "redaction_engine": digest(Path(__file__).with_name("redaction_guard.py")), "pymupdf": fitz.VersionBind, "fonttools": fonttools_version, "source": manifest["source_sha256"], "plans": [digest(work/"pages"/f"{i+1:04}.translation.json") for i in range(manifest["page_count"])], "fonts": {name: digest(assets/name) for name in ["font-simsun.ttf", "font-times.ttf"] if (assets/name).is_file()}}
 
 
 def cached_quality(work, inputs):
@@ -611,73 +611,24 @@ def cached_quality(work, inputs):
 
 
 def math_asset(original, page_number, crop, assets, source_hash):
-    spec = [source_hash, page_number, crop, 4, "glyph-isolation-v1"]
-    key = hashlib.sha256(json.dumps(spec, sort_keys=True).encode()).hexdigest()
-    name = "math-" + key + ".png"
-    path = assets / name
-    record = path.with_suffix(".sha256")
-    if path.is_file() and record.is_file() and digest(path) == record.read_text(encoding="ascii").strip():
-        return name
-    page = original[page_number]
-    rotation = page.rotation
-    isolated = None
-    try:
-        page.set_rotation(0)
-        r = fitz.Rect(crop["bbox"])
-        if crop.get("glyphs"):
-            # A math font's bbox can extend into the previous line. Isolate
-            # selected native glyphs on a throwaway page before rasterizing.
-            chars = [c for b in page.get_text("rawdict")["blocks"] if b["type"] == 0 for line in b["lines"] for span in line["spans"] for c in span["chars"] if c["c"].strip()]
-            def signature(c):
-                return c["c"], tuple(round(v, 3) for v in c["origin"])
-            requested = {signature(c) for c in crop["glyphs"]}
-            selected = [c for c in chars if signature(c) in requested]
-            if {signature(c) for c in selected} != requested:
-                raise ValueError("行内公式的原文字形选择与源 PDF 不符；请重新核实，不截断符号。")
-            if any(not (r+(-1,-1,1,1)).contains(fitz.Rect(c['bbox'])) for c in selected):
-                raise ValueError("公式裁取框没有完整覆盖所选原文字形，停止。")
-            unwanted = [c for c in chars if signature(c) not in requested and intersection(c["bbox"], r) > .001]
-            if unwanted:
-                # MuPDF redaction uses full font boxes. Protect those boxes,
-                # even though compact glyph boxes define the visible crop.
-                small_heights = fitz.TOOLS.set_small_glyph_heights()
-                try:
-                    fitz.TOOLS.set_small_glyph_heights(False)
-                    full = {signature(c):c['bbox'] for b in page.get_text('rawdict')['blocks'] if b['type']==0 for line in b['lines'] for span in line['spans'] for c in span['chars'] if c['c'].strip()}
-                finally:
-                    fitz.TOOLS.set_small_glyph_heights(small_heights)
-                protected_boxes = [full[signature(c)] for c in selected]
-                isolated = fitz.open()
-                isolated.insert_pdf(original, from_page=page_number, to_page=page_number, links=False, annots=False)
-                page = isolated[0]
-                for c in unwanted:
-                    box = fitz.Rect(full[signature(c)])
-                    candidates = []
-                    for fy in [.5, .2, .8, .05, .95]:
-                        for fx in [.5, .2, .8, .05, .95]:
-                            x, y = box.x0+box.width*fx, box.y0+box.height*fy
-                            small = fitz.Rect(x-.05, y-.05, x+.05, y+.05)
-                            if not any(intersection(small, protected) > 0 for protected in protected_boxes):
-                                candidates.append(small)
-                    if not candidates:
-                        raise ValueError("行内公式与邻行文字无法安全分离；请核实裁取区域。")
-                    for small in candidates:
-                        page.add_redact_annot(small, fill=False, cross_out=False)
-                try:
-                    fitz.TOOLS.set_small_glyph_heights(False)
-                    page.apply_redactions(images=0, graphics=0, text=0)
-                finally:
-                    fitz.TOOLS.set_small_glyph_heights(small_heights)
-                survived = {signature(c) for b in page.get_text("rawdict")["blocks"] if b["type"] == 0 for line in b["lines"] for span in line["spans"] for c in span["chars"] if c["c"].strip()}
-                if not requested <= survived or any(signature(c) in survived for c in unwanted):
-                    raise ValueError(f"公式隔离未通过字形完整性检查，停止（缺失 {len(requested-survived)}，邻行残留 {sum(signature(c) in survived for c in unwanted)}）。")
-        page.get_pixmap(matrix=fitz.Matrix(4, 4), clip=r, alpha=False, annots=False).save(path)
-        record.write_text(digest(path), encoding="ascii")
-    finally:
-        original[page_number].set_rotation(rotation)
-        if isolated is not None:
-            isolated.close()
-    return name
+    import importlib.util
+    from types import SimpleNamespace
+    module = globals().get('_crop_guard')
+    if module is None:
+        spec = importlib.util.spec_from_file_location('crop_guard', Path(__file__).with_name('crop_guard.py'))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        globals()['_crop_guard'] = module
+    return module.guarded_asset(original, page_number, crop, assets, source_hash, SimpleNamespace(**globals()))
+
+
+def guarded_remove_text(page, items, source):
+    import importlib.util
+    from types import SimpleNamespace
+    spec = importlib.util.spec_from_file_location('redaction_guard', Path(__file__).with_name('redaction_guard.py'))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.remove_text(page, items, source, SimpleNamespace(**globals()))
 
 
 def redaction_regions(items, source):
@@ -718,28 +669,9 @@ def paragraph_markup(item, run_links, original, pno, assets, source_hash, previe
     fragments.append(html.escape(raw_text[cursor:]))
     text = "".join(fragments).replace("\n", "<br>")
     for m in item.get("math", []):
-        if preview_glyphs is None:
-            name = math_asset(original, pno, m, assets, source_hash)
-        else:
-            # Only the explicitly declared physical image dimensions determine
-            # layout. Defer expensive glyph isolation to the actual build.
-            if m.get("glyphs"):
-                if pno not in preview_glyphs:
-                    chars = [c for b in original[pno].get_text("rawdict")["blocks"] if b["type"] == 0 for l in b["lines"] for s in l["spans"] for c in s["chars"] if c["c"].strip()]
-                    preview_glyphs[pno] = {(c["c"], tuple(round(v, 3) for v in c["origin"])): c for c in chars}
-                requested = {(c["c"], tuple(round(v, 3) for v in c["origin"])) for c in m["glyphs"]}
-                native = preview_glyphs[pno]
-                if not requested <= native.keys():
-                    raise ValueError("行内公式的原文字形选择与源 PDF 不符。")
-                bounds = fitz.Rect(m["bbox"])+(-1,-1,1,1)
-                if any(not bounds.contains(fitz.Rect(native[k]["bbox"])) for k in requested):
-                    raise ValueError("公式裁取框没有完整覆盖所选原文字形。")
-            name = "preflight-placeholder.png"
-            if not (assets/name).is_file():
-                pix = fitz.Pixmap(fitz.csRGB, (0,0,2,2), True)
-                pix.clear_with(0)
-                pix.save(assets/name)
-        r = fitz.Rect(m["bbox"])
+        name = math_asset(original, pno, m, assets, source_hash)
+        proof = load((assets/name).with_suffix('.verified.json'))
+        r = fitz.Rect(proof['bbox'])
         tag = f'<img src="{name}" style="width:{r.width}pt;height:{r.height}pt;vertical-align:middle">'
         text = text.replace("{{math:"+m["id"]+"}}", tag)
     return text
@@ -822,7 +754,7 @@ def layout_preflight(work, manifest, sources, prepared, font_files=None):
     report = {"valid": not errors, "checked_paragraphs": checked, "errors": errors,
               "source_sha256": manifest["source_sha256"], "plan_sha256": plan_hash(work, manifest["page_count"]),
               "seconds": time.perf_counter()-started, "pages": page_times,
-              "formula_isolation_checked": False}
+              "formula_isolation_checked": True}
     save(work / "preflight.json", report)
     return report
 
@@ -898,10 +830,7 @@ def build(args):
             contents = []
             for item in items:
                 contents.append(paragraph_markup(item, run_links, original, pno, assets, manifest["source_sha256"]))
-            for box in redaction_regions(items, sources[pno]):
-                page.add_redact_annot(box, fill=False, cross_out=False)
-            if items:
-                page.apply_redactions(images=0, graphics=0, text=0)
+            guarded_remove_text(page, items, sources[pno])
             for item, text in zip(items, contents):
                 size = item["font_size"]
                 typography = item.get("typography", {})
@@ -978,6 +907,7 @@ def build(args):
     quality["retained_original_link_regions"] = sum(len(check["retained_raw"]) for check in link_checks)
     quality["timings_seconds"] = {**stages, "page_processing": sum(p["seconds"] for p in page_times), "total": time.perf_counter()-started}
     quality["page_timings_seconds"] = page_times
+    quality["native_kept_text_verified"] = True
     quality["build_inputs"] = inputs
     quality["reused_complete_pdf"] = False
     save(work / "quality.json", quality)
@@ -988,6 +918,8 @@ def current_quality(work):
     work = Path(work).resolve()
     manifest = load(work / "manifest.json")
     q = load(work / "quality.json")
+    if q.get('build_inputs') != build_inputs(work, manifest):
+        raise ValueError('生成引擎、字体或字形检查规则已变化；请重建并复核，不沿用旧版通过记录。')
     output = work / q["output"]
     if output.parent != work or digest(output) != q["output_sha256"] or digest(work / "source.pdf") != q["source_sha256"] or plan_hash(work, manifest["page_count"]) != q["plan_sha256"]:
         raise ValueError("产物或翻译计划已变化；请重建并复核。")
