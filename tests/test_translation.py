@@ -89,7 +89,37 @@ def write_plan(work):
 
 
 class Pipeline(unittest.TestCase):
-    def test_layout_preflight_defers_formula_isolation(self):
+    def test_native_equation_survives_nearby_body_removal(self):
+        doc=fitz.open();page=doc.new_page(width=250,height=200)
+        page.insert_text((80,100),'E',fontsize=48)
+        page.insert_text((20,118),'body text below equation',fontsize=9)
+        source=t.page_source(page)
+        spans=[s for b in source['blocks'] for s in b['spans'] if 'body' in s['text']]
+        items=[{'source_ids':[s['id'] for s in spans],'source_spans':spans}]
+        original=[c['origin'] for b in page.get_text('rawdict')['blocks'] if b['type']==0 for l in b['lines'] for s in l['spans'] for c in s['chars'] if c['c']=='E']
+        t.guarded_remove_text(page,items,source)
+        self.assertIn('E',page.get_text());self.assertNotIn('body',page.get_text())
+        actual=[c['origin'] for b in page.get_text('rawdict')['blocks'] if b['type']==0 for l in b['lines'] for s in l['spans'] for c in s['chars'] if c['c']=='E']
+        self.assertEqual(actual,original)
+
+    def test_unverified_image_is_not_a_cache_hit(self):
+        original=fitz.open();original.new_page();original[0].insert_text((50,80),'x')
+        glyph=next(c for b in original[0].get_text('rawdict')['blocks'] if b['type']==0 for l in b['lines'] for sp in l['spans'] for c in sp['chars'])
+        crop={'id':'x','bbox':list(glyph['bbox']),'glyphs':[{'c':glyph['c'],'origin':list(glyph['origin'])}]}
+        assets=self.directory/'proof-cache';assets.mkdir()
+        name=t.math_asset(original,0,crop,assets,'fixture');record=(assets/name).with_suffix('.verified.json');proof=t.load(record);proof['verified']=False;t.save(record,proof)
+        with patch.object(fitz.Page,'get_pixmap',side_effect=AssertionError('revalidation required')):
+            with self.assertRaisesRegex(AssertionError,'revalidation'):t.math_asset(original,0,crop,assets,'fixture')
+        t.math_asset(original,0,crop,assets,'fixture');self.assertTrue(t.load(record)['verified'])
+
+    def test_reference_clipped_by_graphic_is_rejected_without_cache(self):
+        original=fitz.open();original.new_page(width=200,height=150);original[0].insert_text((50,80),'x',fontsize=18);original[0].draw_line((0,75),(200,75))
+        glyph=next(c for b in original[0].get_text('rawdict')['blocks'] if b['type']==0 for l in b['lines'] for sp in l['spans'] for c in sp['chars'])
+        assets=self.directory/'blocked-crops';assets.mkdir()
+        with self.assertRaises(ValueError):t.math_asset(original,0,{'id':'x','bbox':list(glyph['bbox']),'glyphs':[{'c':glyph['c'],'origin':list(glyph['origin'])}]},assets,'fixture')
+        self.assertFalse(list(assets.glob('*.png')));self.assertFalse(list(assets.glob('*.verified.json')))
+
+    def test_layout_preflight_checks_real_formula_images(self):
         path = self.work/'pages/0001.translation.json'
         plan = t.load(path)
         item = plan['items'][0]
@@ -98,12 +128,13 @@ class Pipeline(unittest.TestCase):
         item['text'] = '标题{{math:probe}}'
         item['math'] = [{'id':'probe', 'bbox':span['bbox']}]
         t.save(path, plan)
-        with patch.object(t, 'math_asset', side_effect=AssertionError('preflight must not isolate glyphs')):
+        with patch.object(t, 'math_asset', wraps=t.math_asset) as checked:
             quiet(t.preflight, args(work=str(self.work)))
         report = t.load(self.work/'preflight.json')
         self.assertTrue(report['valid'])
-        self.assertFalse(report['formula_isolation_checked'])
-        self.assertFalse(list((self.work/'math-assets').glob('math-*.png')))
+        self.assertTrue(report['formula_isolation_checked'])
+        self.assertGreater(checked.call_count,0)
+        self.assertTrue(list((self.work/'math-assets').glob('math-*.verified.json')))
         self.assertFalse((self.work/'中文全文译文.pdf').exists())
 
     def test_preflight_collects_multiple_failures_without_changing_plans_or_pdf(self):
@@ -169,7 +200,11 @@ class Pipeline(unittest.TestCase):
         self.assertNotEqual(raw.samples,expected.samples)
         assets=self.directory/'isolated-math';assets.mkdir()
         name=t.math_asset(original,0,crop,assets,'synthetic-source')
+        proof=t.load((assets/name).with_suffix('.verified.json'))
+        expected=ref[0].get_pixmap(matrix=fitz.Matrix(4,4),clip=fitz.Rect(proof['bbox']),alpha=True)
         self.assertEqual(fitz.Pixmap(assets/name).samples,expected.samples)
+        self.assertTrue(proof['reference_pixel_check'])
+        self.assertTrue(proof['expanded_canvas_check'])
         with patch.object(fitz.Page,'get_pixmap',side_effect=AssertionError('Intact math cache rerendered')):
             self.assertEqual(t.math_asset(original,0,crop,assets,'synthetic-source'),name)
         bad=copy.deepcopy(crop);bad['glyphs'][0]['c']='z'
