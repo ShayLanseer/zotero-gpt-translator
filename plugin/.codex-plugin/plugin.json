@@ -1,6 +1,6 @@
 {
   "name": "zotero-gpt-translator",
-  "version": "0.1.10",
+  "version": "0.1.11",
   "description": "用当前聊天中的 GPT 翻译 Zotero 论文全文，尽量保持原页排版与链接，生成中文 PDF 并添加到原条目。",
   "author": {"name": "Lanseer"},
   "skills": "./skills/",
