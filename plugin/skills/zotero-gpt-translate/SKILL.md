@@ -21,6 +21,12 @@ description: 将 Zotero 论文全文翻译为中文 PDF 并添加到原条目。
 
 正文中的形式模板、占位符、字段/槽位名称，以及用来演示模板或模型输入的英文例句/指令，也保留原文。示例包括 `<action><target-class>[<spatial-relation><anchor-class(es)>]`、action、target、anchor、spatial-relation，以及 `sit on the armchair near the desk`。保留原文字面内容及其颜色、字体、斜体、括号、大小写、连字符、可选项标记和顺序，使模板与示例的配色对应关系不变；不要将其替换为纯中文。必要时可在原文后附中文括号释义，例如 `sit on the armchair near the desk（坐在书桌旁的扶手椅上）`，中文释义用正文样式，不能插入模板内部或替代原文。周围的解释性正文照常翻译，不因含有模板/示例而保留整段英文。具体保留与复核方式见 references/workflow.md。
 
+## 引语与下划线的语义及排版规则
+
+引号本身不表示“例句免翻译”。描述方法原则、目标、术语解释、作者观点、对比或强调的普通引语必须翻译，即使带双引号、斜体、颜色或下划线。例如 “change what is requested, preserve the rest” 应译为“修改所要求的部分，保留其余部分”；“edit the change, preserve the rest” 应译为“编辑需改动的部分，保留其余部分”。只有上下文明确将文字作为模型实际输入、具体编辑指令、形式模板、字段或模板实例展示时，才保留原文，并记录语义依据。不得仅凭英文、引号或命令式语气判断。旧分段稿的 e 标记必须重新分类，不能机械全部作为图片插回。
+
+正文下划线属于文字强调，不属于需要原位置保留的图形。prepare/draft 在 catalog 的 underlines 中记录原文范围与 u 编号；翻译时为对应译文填写 underlines 映射，按最终文字位置重建下划线，换行时逐行绘制。原文字区域中的旧线应先安全移除，并核对表格线、其他图形、图像及文字未被连带影响。缺少映射、跨段来源、公式图片混入范围或不能安全分离时停止生成；不得在空白处或其他正文中保留孤立下划线。图表内部原样保留的线不迁移。详见 workflow.md；旧质量记录不适用于本次规则。
+
 ## 运行与定位
 
 脚本为本技能目录下 `scripts/translate.py`。使用已安装 PyMuPDF 的 Python；可设置 `ZGT_DEPS` 为独立的 PyMuPDF 包目录，本机安装也可通过 `scripts/runtime.local.json` 定位依赖。`doctor` 检查依赖。不要猜运行环境：必要时用桌面 `load_workspace_dependencies` 定位 Python，或按 `requirements.txt` 在工作目录创建隔离依赖。连接配置默认从工作目录向上查找 `.zotero/connection.json`，也可通过 `--config` 指定。
