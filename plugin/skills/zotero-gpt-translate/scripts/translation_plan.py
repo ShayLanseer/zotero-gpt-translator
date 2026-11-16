@@ -12,6 +12,7 @@ def draft(work, api):
     with api.fitz.open(work/'source.pdf') as doc:
         for source in sources:
             pno=source['page'];raw=doc[pno-1].get_text('rawdict')
+            source_underlines=api.decoration_api('detect',doc[pno-1])
             links=[json.loads(value) for value in source['links']]
             for link in links:
                 link['from']=list(api.fitz.Rect(link['from'])*doc[pno-1].derotation_matrix)
@@ -46,10 +47,8 @@ def draft(work, api):
                     if c['size']>=base*.82:continue
                     nearby=[j for j in range(max(0,pos-8),min(len(chars),pos+9)) if chars[j] and types[j] and types[j][0]=='m' and chars[j]['line']==c['line']]
                     if any(abs(c['bbox'][0]-chars[j]['bbox'][2])<12 or abs(chars[j]['bbox'][0]-c['bbox'][2])<12 for j in nearby):types[pos]=('m','math',None,None)
-                for quote in re.finditer('“[^”]+”',text):
-                    if not any(types[j] and types[j][0]=='r' for j in range(quote.start(),quote.end())):
-                        for j in range(quote.start(),quote.end()):
-                            if chars[j] and chars[j]['c'].strip():types[j]=('e','example',None,None)
+                # Quotation marks are punctuation, not evidence of model input.
+                # Preserve examples only after explicit semantic classification.
                 regions=[]
                 for pos,kind in enumerate(types):
                     if not kind:continue
@@ -71,7 +70,8 @@ def draft(work, api):
                     else:token.update(bbox=list(api.union([{'bbox':c['bbox']} for c in region['chars']])),glyphs=[{'c':c['c'],'origin':list(c['origin'])} for c in region['chars']])
                     tokens[name]=token
                 pieces.append(text[cursor:]);marked=''.join(pieces)
-                entry={'id':key,'source_ids':[s['id'] for s in block['spans']],'bbox':block['bbox'],'text':marked,'tokens':tokens}
+                entry={'id':key,'source_ids':[s['id'] for s in block['spans']],'bbox':block['bbox'],'text':marked,'tokens':tokens,
+                       'underlines':[u for u in source_underlines if set(u['source_ids']) & {s['id'] for s in block['spans']}]}
                 page['blocks'].append(entry);target['blocks'].append({'id':key,'mode':None,'role':'body','text':None})
                 readable.append(key+' '+marked.replace('\n',' '))
                 if tokens:readable.append('  '+ '; '.join(k+'='+v['text'] for k,v in tokens.items()))
@@ -104,6 +104,16 @@ def compile_plan(work, api):
                 plain=text[last:match.start()];parts.append(plain);length+=len(plain);name=match[1]
                 if name not in b['tokens'] or name in used:raise ValueError(key+' 的标记未知或重复：'+name)
                 token=b['tokens'][name];used.add(name)
+                if token['type']=='e':
+                    replacement=edit.get('token_translations',{}).get(name)
+                    decision=edit.get('preserve_tokens',{}).get(name,{})
+                    if replacement is not None and decision:raise ValueError(key+' 的引语不可同时翻译和保留。')
+                    if replacement is not None:
+                        if not isinstance(replacement,str) or not replacement.strip() or '{{' in replacement:
+                            raise ValueError(key+' 的引文译文无效。')
+                        parts.append(replacement);length+=len(replacement);last=match.end();continue
+                    if decision.get('kind') not in {'template','field','model_input','example_input'} or not decision.get('reason','').strip():
+                        raise ValueError(key+' 的旧示例标记 '+name+' 需重新分类：普通引语填写 token_translations，确为模板/模型输入才填写 preserve_tokens 的 kind/reason。')
                 if token['type']=='r':
                     value=token['text'];start=length
                     if token['kind']=='crossref':
@@ -112,6 +122,7 @@ def compile_plan(work, api):
                     runs.append({'start':start,'end':length+len(value),'kind':token['kind'],'link':token['link']})
                 else:
                     value='{{math:'+name+'}}';maths.append({k:token[k] for k in ['bbox','glyphs']});maths[-1]['id']=name
+                    if token['type']=='e':maths[-1]['preservation']=decision
                 parts.append(value);length+=len(value);last=match.end()
             parts.append(text[last:]);text=''.join(parts)
             omitted=[name for name,t in b['tokens'].items() if name not in used and (t['type']=='r' or edit.get('role','body') not in ['heading','metadata'])]
@@ -119,6 +130,13 @@ def compile_plan(work, api):
             for run in runs:run['text']=text[run['start']:run['end']]
             role=edit.get('role','body');height=b['bbox'][3]-b['bbox'][1]
             item={'source_ids':expected[key],'text':text,'math':maths,'runs':runs,'typography':{'family':'song','line_height':1.05 if role=='heading' else 1.15 if role=='caption' else 1.2 if height<30 else 1.45,'indent_em':0 if role in ['heading','caption'] else 2,'weight':'normal','align':'left'}}
+            item['underlines']=[]
+            for mark in edit.get('underlines',[]):
+                value=mark.get('text','');start=mark.get('start')
+                if start is None:
+                    if not value or text.count(value)!=1:raise ValueError(key+' 下划线译文须唯一，重复时指定 start。')
+                    start=text.index(value)
+                item['underlines'].append({'source':mark['source'],'start':start,'end':start+len(value),'text':value})
             for field in ['bbox','font_size','typography','image_overlap_review']:
                 if field in edit:item[field]=edit[field]
             plan['items'].append(item)

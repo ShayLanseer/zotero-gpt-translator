@@ -593,7 +593,7 @@ def rendering_fonts(assets, prepared):
 def build_inputs(work, manifest):
     assets = work / "math-assets"
     from fontTools import __version__ as fonttools_version
-    return {"engine": digest(__file__), "crop_engine": digest(Path(__file__).with_name("crop_guard.py")), "redaction_engine": digest(Path(__file__).with_name("redaction_guard.py")), "pymupdf": fitz.VersionBind, "fonttools": fonttools_version, "source": manifest["source_sha256"], "plans": [digest(work/"pages"/f"{i+1:04}.translation.json") for i in range(manifest["page_count"])], "fonts": {name: digest(assets/name) for name in ["font-simsun.ttf", "font-times.ttf"] if (assets/name).is_file()}}
+    return {"engine": digest(__file__), "crop_engine": digest(Path(__file__).with_name("crop_guard.py")), "redaction_engine": digest(Path(__file__).with_name("redaction_guard.py")), "decoration_engine": digest(Path(__file__).with_name("decoration_guard.py")), "plan_engine": digest(Path(__file__).with_name("translation_plan.py")), "pymupdf": fitz.VersionBind, "fonttools": fonttools_version, "source": manifest["source_sha256"], "plans": [digest(work/"pages"/f"{i+1:04}.translation.json") for i in range(manifest["page_count"])], "fonts": {name: digest(assets/name) for name in ["font-simsun.ttf", "font-times.ttf"] if (assets/name).is_file()}}
 
 
 def cached_quality(work, inputs):
@@ -649,32 +649,30 @@ def redaction_regions(items, source):
 
 
 def paragraph_markup(item, run_links, original, pno, assets, source_hash, preview_glyphs=None):
-    raw_text = item["text"]
-    fragments, cursor = [], 0
-    for run in sorted(item.get("runs", []), key=lambda r: r["start"]):
-        start, end = run["start"], run["end"]
-        if start < cursor or end <= start or raw_text[start:end] != run["text"]:
-            raise ValueError("引用区间重叠或与原文不符。")
-        if run.get("kind") not in {"citation", "crossref", "hyperlink"}:
-            raise ValueError("引用标注类别无效。")
-        if len(run_links) >= 150:
-            raise ValueError("单页引用标注数量过多。")
-        # Encode unique locator colors without carrying blue into
-        # green on citation-heavy pages (the previous +index did).
-        index = len(run_links)
-        color_key = (0xB02020 if run["kind"] == "crossref" else 0x0060A0) + ((index % 40) << 8) + index // 40
-        run_links[color_key] = run.get("link")
-        fragments.extend([html.escape(raw_text[cursor:start]), f'<span style="color:#{color_key:06x}">'+html.escape(raw_text[start:end])+"</span>"])
-        cursor = end
-    fragments.append(html.escape(raw_text[cursor:]))
-    text = "".join(fragments).replace("\n", "<br>")
-    for m in item.get("math", []):
+    text = decoration_api('markup', item, run_links)
+    for m in item.get('math', []):
+        quoted=''.join(g['c'] for g in m.get('glyphs',[])).strip()
+        if quoted.startswith(('“','"','‘')) and quoted.endswith(('”','"','’')):
+            decision=m.get('preservation',{})
+            if decision.get('kind') not in {'template','field','model_input','example_input'} or not decision.get('reason','').strip():
+                raise ValueError('带引号的原文裁图需重新判断语义，普通引语应翻译；确为模型输入才明确保留。')
         name = math_asset(original, pno, m, assets, source_hash)
         proof = load((assets/name).with_suffix('.verified.json'))
         r = fitz.Rect(proof['bbox'])
         tag = f'<img src="{name}" style="width:{r.width}pt;height:{r.height}pt;vertical-align:middle">'
-        text = text.replace("{{math:"+m["id"]+"}}", tag)
+        text = text.replace('{{math:'+m['id']+'}}', tag)
     return text
+
+
+def decoration_api(operation, *args):
+    import importlib.util
+    from types import SimpleNamespace
+    if '_decoration_guard' not in globals():
+        spec = importlib.util.spec_from_file_location('decoration_guard', Path(__file__).with_name('decoration_guard.py'))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        globals()['_decoration_guard'] = module
+    return getattr(globals()['_decoration_guard'], operation)(*args, SimpleNamespace(**globals()))
 
 
 def paragraph_style(item, text, assets, font_files):
@@ -738,6 +736,10 @@ def layout_preflight(work, manifest, sources, prepared, font_files=None):
         for pno, items in enumerate(prepared):
             page_start = time.perf_counter()
             run_links = {}
+            try:
+                decoration_api('checked', original[pno], items)
+            except (ValueError, KeyError, TypeError) as exc:
+                errors.append({'page': pno+1, 'source_ids': ['underlines'], 'error': str(exc)})
             with fitz.open() as scratch:
                 page = scratch.new_page(width=sources[pno]["width"], height=sources[pno]["height"])
                 for item in items:
@@ -830,6 +832,8 @@ def build(args):
             contents = []
             for item in items:
                 contents.append(paragraph_markup(item, run_links, original, pno, assets, manifest["source_sha256"]))
+            underlines = decoration_api('checked', page, items)
+            decoration_api('remove', page, underlines)
             guarded_remove_text(page, items, sources[pno])
             for item, text in zip(items, contents):
                 size = item["font_size"]
@@ -843,6 +847,7 @@ def build(args):
                     if not chinese_spans or any("simsun" not in s["font"].lower() for s in chinese_spans):
                         raise ValueError(f"第 {pno+1} 页宋体未实际生效，拒绝静默使用回退字体。")
                 measurements.append({"page": pno+1, "source_ids": item["source_ids"], "scale": scale, "font_size": size*scale, "bbox": item["bbox"], "image_overlap_review": item.get("image_overlap_review")})
+            painted_underlines = decoration_api('paint', page, run_links)
             restore_links(doc, page, links, moved_xrefs)
             seen_runs = set()
             page_added = 0
@@ -853,6 +858,8 @@ def build(args):
                     for line in block["lines"]:
                         for span in line["spans"]:
                             target = run_links.get(span["color"])
+                            if isinstance(target, dict) and target.get('__underline'):
+                                target = target['target']
                             if target:
                                 seen_runs.add(span["color"])
                                 destination = link_target(target)
@@ -865,15 +872,17 @@ def build(args):
                                 page.insert_link({**destination, "from": fitz.Rect(span["bbox"])})
                                 added_link_count += 1
                                 page_added += 1
-            if any(target and color not in seen_runs for color, target in run_links.items()):
+            if any((target.get('target') if isinstance(target, dict) and target.get('__underline') else target) and color not in seen_runs for color, target in run_links.items()):
                 raise ValueError("有链接未找到实际译文文字区域，停止以避免丢失或错位。")
+            if any(isinstance(target, dict) and target.get('__underline') and color not in painted_underlines[0] for color, target in run_links.items()):
+                raise ValueError('下划线未找到实际译文文字，停止生成。')
             page = doc.reload_page(page)
             active_xrefs = {xref for xref, kind, *_ in page.annot_xrefs() if kind == fitz.PDF_ANNOT_LINK}
             if active_xrefs.intersection(moved_xrefs):
                 raise ValueError("旧原文链接热区仍存在，停止。")
             if preserved_signatures - Counter(link_signature(page)) or len(page.get_links()) != sum(preserved_signatures.values()) + page_added:
                 raise ValueError("链接数量与保留/重建记录不一致。")
-            link_checks.append({"retained_raw": [raw for _, raw in links], "expected_links": link_signature(page), "removed_xrefs": moved_xrefs, "removed_original_regions": len(moved_links)})
+            link_checks.append({"retained_raw": [raw for _, raw in links], "expected_links": link_signature(page), "removed_xrefs": moved_xrefs, "removed_original_regions": len(moved_links), 'removed_source_underlines':len(underlines), 'translated_underline_fragments':painted_underlines[1]})
             page_times.append({"page": pno+1, "seconds": time.perf_counter()-page_start})
         # Original destination xref references remain stable (no renumbering).
         # Embed only glyphs actually used; CJK font collections otherwise add
@@ -908,6 +917,7 @@ def build(args):
     quality["timings_seconds"] = {**stages, "page_processing": sum(p["seconds"] for p in page_times), "total": time.perf_counter()-started}
     quality["page_timings_seconds"] = page_times
     quality["native_kept_text_verified"] = True
+    quality['underline_migration'] = [{k:c[k] for k in ('removed_source_underlines','translated_underline_fragments')} for c in link_checks]
     quality["build_inputs"] = inputs
     quality["reused_complete_pdf"] = False
     save(work / "quality.json", quality)
