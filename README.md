@@ -2,7 +2,7 @@
 
 面向本地桌面 Codex 的论文全文翻译插件。由当前聊天模型逐段翻译，Python 脚本负责读取 PDF、校验翻译计划、排版和将译文添加到 Zotero 原条目。
 
-当前插件版本：**0.1.11**。这是 Codex 插件，不是安装进 Zotero 的 `.xpi` 扩展。更新内容和性能边界见 [CHANGELOG.md](CHANGELOG.md)。
+当前插件版本：**0.1.12**。这是 Codex 插件，不是安装进 Zotero 的 `.xpi` 扩展。更新内容和性能边界见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 能做什么
 
@@ -129,10 +129,10 @@ py -3.12 .\plugin\skills\zotero-gpt-translate\scripts\translate.py fonts --work 
 
 ```powershell
 $env:ZGT_DEPS = (Resolve-Path .\.runtime).Path
-py -3.12 -X utf8 .\tests\test_translation.py
+py -3.12 -X utf8 -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
-测试产物位于 `test-output/`，不提交到仓库。当前版本通过 23 项离线行为测试，覆盖几何约束、链接、公式裁图像素与边界检查、邻近原生公式保留、字体、缓存、复核失效、模拟附件重试、批量排版失败报告和预检实际公式隔离等行为；通过测试不等于任意真实论文的端到端翻译已通过。
+测试产物位于 `test-output/`，不提交到仓库。当前版本通过 28 项离线行为测试，覆盖几何约束、链接、公式裁图像素与边界检查、邻近原生公式保留、字体、缓存、复核失效、模拟附件重试、批量排版失败报告和预检实际公式隔离、引语分类、下划线迁移及与链接重叠等行为；通过测试不等于任意真实论文的端到端翻译已通过。
 
 ## 仓库内容
 
