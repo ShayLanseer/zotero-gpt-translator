@@ -119,6 +119,12 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         raise ValueError("拒绝 Zotero API 重定向；请检查本机连接。")
 
 
+class APIError(ValueError):
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status = status
+
+
 class API:
     def __init__(self, path):
         self.config_path = Path(path).resolve()
@@ -133,6 +139,10 @@ class API:
         self.root = "/users/0"
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
         self.token = None
+        self.remember = False
+        self.auth_cache = None
+        self._cache_attempted = False
+        self._cache_loaded = False
 
     @staticmethod
     def local_url(url):
@@ -154,7 +164,7 @@ class API:
                 return response.status, json.loads(data) if data and "json" in response.headers.get("Content-Type", "") else data
         except urllib.error.HTTPError as e:
             # Do not expose API keys, document content, or untrusted HTML error bodies.
-            raise ValueError(f"Zotero {method} 请求失败：HTTP {e.code} ({path or '本机上传'})") from e
+            raise APIError(e.code, f"Zotero {method} 请求失败：HTTP {e.code} ({path or '本机上传'})") from None
 
     def get(self, path):
         return self.request(path)[1]
@@ -187,16 +197,70 @@ class API:
             raise ValueError("原 PDF 尚未下载到本机。")
         return path
 
+    def _credentials(self):
+        if not self._cache_attempted:
+            self._cache_attempted = True
+            try:
+                import importlib.util
+                spec = importlib.util.spec_from_file_location('zgt_auth_cache', Path(__file__).with_name('auth_cache.py'))
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                self.auth_cache = module.CredentialCache(self.base, self.root, self.server_id)
+            except Exception:
+                print('警告：无法定位 Windows 加密授权缓存；本次授权仍可使用，下次可能再次询问。', file=sys.stderr)
+        return self.auth_cache
+
+    def _load_credentials(self):
+        if self._cache_loaded:
+            return
+        self._cache_loaded = True
+        cache = self._credentials()
+        if cache:
+            try:
+                self.token = cache.load()
+                self.remember = bool(self.token)
+            except Exception:
+                print('警告：加密授权缓存无法读取或与实例不匹配，将请求重新授权。', file=sys.stderr)
+
     def authorize(self):
-        _, result = self.request("/local/authorize", "POST", json.dumps({"appName": "Zotero GPT 全文翻译"}).encode(), {"Content-Type": "application/json"}, timeout=180)
-        if not result.get("key"):
-            raise ValueError("未获得 Zotero 本机写入授权；请由用户处理 Zotero 授权界面。")
-        self.token = result["key"]
+        _, result = self.request('/local/authorize', 'POST', json.dumps({'appName': 'Zotero GPT 全文翻译'}).encode(), {'Content-Type': 'application/json'}, timeout=180)
+        if not result.get('key'):
+            raise ValueError('未获得 Zotero 本机写入授权；请由用户处理 Zotero 授权界面。')
+        self.token = result['key']
+        self.remember = result.get('remember') is True
+        # Only Always Allow is persistent. A one-time grant must never be cached.
+        if self.remember:
+            cache = self._credentials()
+            if cache:
+                try:
+                    cache.save(self.token)
+                except Exception as exc:
+                    detail = type(exc).__name__ + ': winerror=' + str(getattr(exc, 'winerror', None)) + ', errno=' + str(getattr(exc, 'errno', None))
+                    print('警告：无法保存加密授权（' + detail + '）；本次可用，下次可能再次询问。', file=sys.stderr)
 
     def write(self, path, body, headers=None):
-        if not self.token:
-            self.authorize()
-        return self.request(path, "POST", body, {"Zotero-API-Key": self.token, **(headers or {})})
+        self._load_credentials()
+        for attempt in range(2):
+            if not self.token:
+                self.authorize()
+            try:
+                return self.request(path, 'POST', body, {'Zotero-API-Key': self.token, **(headers or {})})
+            except APIError as exc:
+                if exc.status != 401 or attempt:
+                    raise
+                # A 401 is rejected before mutation. Retry this exact request once,
+                # retaining caller write tokens; never retry ambiguous failures.
+                cache = self._credentials()
+                if cache:
+                    try:
+                        cache.invalidate()
+                    except Exception:
+                        print('警告：无法标记失效授权缓存；本进程仍会重新授权。', file=sys.stderr)
+                self.token = None
+                self.remember = False
+            finally:
+                if not self.remember:
+                    self.token = None
 
 
 def snapshot_links(page):
@@ -593,7 +657,7 @@ def rendering_fonts(assets, prepared):
 def build_inputs(work, manifest):
     assets = work / "math-assets"
     from fontTools import __version__ as fonttools_version
-    return {"engine": digest(__file__), "crop_engine": digest(Path(__file__).with_name("crop_guard.py")), "redaction_engine": digest(Path(__file__).with_name("redaction_guard.py")), "decoration_engine": digest(Path(__file__).with_name("decoration_guard.py")), "plan_engine": digest(Path(__file__).with_name("translation_plan.py")), "pymupdf": fitz.VersionBind, "fonttools": fonttools_version, "source": manifest["source_sha256"], "plans": [digest(work/"pages"/f"{i+1:04}.translation.json") for i in range(manifest["page_count"])], "fonts": {name: digest(assets/name) for name in ["font-simsun.ttf", "font-times.ttf"] if (assets/name).is_file()}}
+    return {"engine": digest(__file__), "crop_engine": digest(Path(__file__).with_name("crop_guard.py")), "redaction_engine": digest(Path(__file__).with_name("redaction_guard.py")), "decoration_engine": digest(Path(__file__).with_name("decoration_guard.py")), "authorization_engine": digest(Path(__file__).with_name("auth_cache.py")), "plan_engine": digest(Path(__file__).with_name("translation_plan.py")), "pymupdf": fitz.VersionBind, "fonttools": fonttools_version, "source": manifest["source_sha256"], "plans": [digest(work/"pages"/f"{i+1:04}.translation.json") for i in range(manifest["page_count"])], "fonts": {name: digest(assets/name) for name in ["font-simsun.ttf", "font-times.ttf"] if (assets/name).is_file()}}
 
 
 def cached_quality(work, inputs):
@@ -993,13 +1057,33 @@ def attach(args, api_factory=API):
         raise ValueError("Zotero 中原 PDF 已改变，停止。")
     filename = f"GPT-zh-{binding['source_key']}-{q['output_sha256'][:12]}.pdf"
     title = manifest.get("attachment_title") or f"中文全文译文 · GPT · {binding['source_key']}"
-    children = api.children(binding["parent_key"])
+    emit(upload_pdf(api, binding["parent_key"], binding["library_id"], output, title, work/"attachment.json", filename=filename))
+
+
+def upload_pdf(api, parent_key, library_id, output, title, journal_path, filename=None, tags=None):
+    """Shared, journaled PDF upload for translations, reading notes and diagnostics.
+
+    The caller must have explicit user permission for this PDF and parent item.
+    """
+    output = Path(output).resolve()
+    journal_path = Path(journal_path).resolve()
+    require_pdf()
+    with fitz.open(output) as doc:
+        if not doc.is_pdf or doc.needs_pass or not len(doc):
+            raise ValueError('挂载文件必须为可读取的 PDF。')
+    parent = api.item(parent_key)
+    if parent['data'].get('itemType') in {'attachment','note'} or parent['data'].get('deleted') or parent.get('library',{}).get('id') != library_id:
+        raise ValueError('挂载父条目或文库不匹配。')
+    output_hash = digest(output)
+    filename = filename or ('GPT-PDF-'+output_hash[:16]+'.pdf')
+    if Path(filename).name != filename or not filename.lower().endswith('.pdf'):
+        raise ValueError('挂载文件名无效。')
+    children = api.children(parent_key)
     same = [x for x in children if x["data"].get("filename") == filename]
     if len(same) > 1:
         raise ValueError("同名译文附件多于一个，停止以免重复。")
-    journal_path = work / "attachment.json"
     journal = load(journal_path) if journal_path.exists() else None
-    if journal and journal.get("output_sha256") != q["output_sha256"]:
+    if journal and journal.get("output_sha256") != output_hash:
         raise ValueError("本工作目录曾上传不同版本；请用新工作目录保留历史。")
     if journal and journal.get("state") == "creating" and not same:
         raise ValueError("上次创建结果未知，先 inspect 父条目核实，不自动重建。")
@@ -1007,15 +1091,15 @@ def attach(args, api_factory=API):
     if key and key not in {x["key"] for x in children}:
         raise ValueError("日志中的附件已不存在或移走，停止。")
     if not key:
-        save(journal_path, {"state": "creating", "output_sha256": q["output_sha256"], "filename": filename, "parent_key": binding["parent_key"]})
-        record = {"itemType": "attachment", "parentItem": binding["parent_key"], "linkMode": "imported_file", "title": title, "contentType": "application/pdf", "filename": filename, "tags": [{"tag": "GPT中文全文译文"}], "relations": {}, "note": ""}
+        save(journal_path, {"state": "creating", "output_sha256": output_hash, "filename": filename, "parent_key": parent_key})
+        record = {"itemType": "attachment", "parentItem": parent_key, "linkMode": "imported_file", "title": title, "contentType": "application/pdf", "filename": filename, "tags": tags if tags is not None else [{"tag": "GPT中文全文译文"}], "relations": {}, "note": ""}
         _, result = api.write(api.root + "/items", json.dumps([record], ensure_ascii=False).encode(), {"Content-Type": "application/json", "Zotero-Write-Token": uuid.uuid4().hex})
         if result.get("failed") or "0" not in result.get("success", {}):
             raise ValueError("Zotero 创建附件失败；查看父条目后重试，不删除任何条目。")
         key = result["success"]["0"]
-        save(journal_path, {"state": "created", "attachment_key": key, "output_sha256": q["output_sha256"], "filename": filename, "parent_key": binding["parent_key"]})
+        save(journal_path, {"state": "created", "attachment_key": key, "output_sha256": output_hash, "filename": filename, "parent_key": parent_key})
     data = api.item(key)["data"]
-    if data.get("parentItem") != binding["parent_key"] or data.get("contentType") != "application/pdf" or data.get("linkMode") != "imported_file":
+    if data.get("parentItem") != parent_key or data.get("contentType") != "application/pdf" or data.get("linkMode") != "imported_file":
         raise ValueError("目标附件属性不匹配，停止。")
     raw = output.read_bytes()
     md5 = hashlib.md5(raw).hexdigest()
@@ -1037,13 +1121,13 @@ def attach(args, api_factory=API):
             if status != 204:
                 raise ValueError("附件上传登记失败，请核实后重试。")
     actual = api.item(key)["data"]
-    if actual.get("parentItem") != binding["parent_key"] or actual.get("md5", "").lower() != md5:
+    if actual.get("parentItem") != parent_key or actual.get("md5", "").lower() != md5:
         raise ValueError("附件父条目/MD5 核验失败，保留日志。")
-    if digest(api.file_path(key)) != q["output_sha256"]:
+    if digest(api.file_path(key)) != output_hash:
         raise ValueError("附件本机文件 SHA256 核验失败。")
-    result = {"state": "verified", "parent_key": binding["parent_key"], "attachment_key": key, "filename": filename, "output_sha256": q["output_sha256"]}
+    result = {"state": "verified", "parent_key": parent_key, "attachment_key": key, "filename": filename, "output_sha256": output_hash}
     save(journal_path, result)
-    emit(result)
+    return result
 
 
 def main():
